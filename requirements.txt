@@ -1,0 +1,7 @@
+ollama
+pydantic
+sentence-transformers
+networkx
+pyvis
+streamlit
+requests
