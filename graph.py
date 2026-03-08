@@ -1,15 +1,8 @@
 """
-Memory graph built on NetworkX MultiDiGraph.
-
-Represents entities as nodes and claims as directed edges,
-with evidence stored as edge attributes.
-
-Features:
-- MultiDiGraph: multiple directed edges between same nodes (different relations)
-- Event time vs validity time tracked on edges
-- Incremental ingestion with idempotency (skip existing IDs)
-- Observability: extraction quality metrics
-- Serialization to/from JSON
+The actual knowledge graph — built on top of NetworkX's MultiDiGraph.
+Entities become nodes, claims become directed edges, and all the evidence
+lives as edge attributes. Supports having multiple different relationships
+between the same pair of entities, which happens a lot in real email data.
 """
 
 import json
@@ -23,7 +16,7 @@ from schema import Claim, Entity, MemoryStore
 
 
 class MemoryGraph:
-    """In-memory knowledge graph backed by NetworkX."""
+    """The main knowledge graph. Wraps a NetworkX MultiDiGraph with ingestion and query methods."""
 
     def __init__(self):
         self.graph = nx.MultiDiGraph()
@@ -37,10 +30,10 @@ class MemoryGraph:
             "orphan_claims_skipped": 0,
         }
 
-    # ── Ingestion ──────────────────────────────────────────────────────────
+    # -- Adding data to the graph --
 
     def ingest_entity(self, entity: Entity):
-        """Add an entity as a node. Idempotent: skips if already ingested."""
+        """Add an entity as a graph node. Safe to call multiple times — duplicates are skipped."""
         if entity.id in self._ingested_entity_ids:
             self._metrics["duplicate_entities_skipped"] += 1
             return
@@ -56,12 +49,12 @@ class MemoryGraph:
         self._metrics["total_entities_ingested"] += 1
 
     def ingest_claim(self, claim: Claim):
-        """Add a claim as a directed edge. Idempotent."""
+        """Add a claim as a directed edge between two entities. Skips duplicates and orphans."""
         if claim.id in self._ingested_claim_ids:
             self._metrics["duplicate_claims_skipped"] += 1
             return
 
-        # Check that both endpoints exist
+        # both the subject and object entities need to exist in the graph
         if claim.subject_id not in self._ingested_entity_ids:
             self._metrics["orphan_claims_skipped"] += 1
             return
@@ -69,7 +62,7 @@ class MemoryGraph:
             self._metrics["orphan_claims_skipped"] += 1
             return
 
-        # Serialize evidence for storage
+        # turn evidence into plain dicts for storage on the edge
         evidence_data = [ev.model_dump() for ev in claim.evidence]
 
         self.graph.add_edge(
@@ -88,7 +81,7 @@ class MemoryGraph:
         self._metrics["total_claims_ingested"] += 1
 
     def ingest_store(self, store: MemoryStore):
-        """Ingest an entire MemoryStore into the graph."""
+        """Load a full MemoryStore into the graph in one go."""
         print(f"Ingesting {len(store.entities)} entities and {len(store.claims)} claims...")
 
         for entity in store.entities.values():
@@ -100,18 +93,18 @@ class MemoryGraph:
         print(f"Graph now has {self.graph.number_of_nodes()} nodes and "
               f"{self.graph.number_of_edges()} edges.")
 
-    # ── Querying ───────────────────────────────────────────────────────────
+    # -- Querying --
 
     def get_node(self, entity_id: str) -> dict:
-        """Get node attributes."""
+        """Look up a node's attributes by ID."""
         if entity_id in self.graph:
             return dict(self.graph.nodes[entity_id])
         return {}
 
     def get_neighbors(self, entity_id: str, current_only: bool = True) -> list[dict]:
-        """Get all claims (edges) connected to an entity."""
+        """Get all the claims (edges) connected to a given entity, both incoming and outgoing."""
         results = []
-        # Outgoing edges
+        # outgoing
         for _, target, key, data in self.graph.out_edges(entity_id, data=True, keys=True):
             if current_only and not data.get("is_current", True):
                 continue
@@ -122,7 +115,7 @@ class MemoryGraph:
                 "direction": "outgoing",
                 **data,
             })
-        # Incoming edges
+        # incoming
         for source, _, key, data in self.graph.in_edges(entity_id, data=True, keys=True):
             if current_only and not data.get("is_current", True):
                 continue
@@ -136,7 +129,7 @@ class MemoryGraph:
         return results
 
     def find_entities_by_name(self, query: str) -> list[str]:
-        """Find entity IDs whose name or aliases match a query (case-insensitive)."""
+        """Search for entities whose name or aliases contain the query string."""
         query_lower = query.lower()
         results = []
         for nid, data in self.graph.nodes(data=True):
@@ -147,7 +140,7 @@ class MemoryGraph:
         return results
 
     def get_subgraph(self, entity_ids: list[str], depth: int = 1) -> nx.MultiDiGraph:
-        """Get a subgraph around the given entities up to a given depth."""
+        """Pull out a neighborhood around the given entities, going N hops deep."""
         nodes = set(entity_ids)
         for _ in range(depth):
             new_nodes = set()
@@ -158,10 +151,10 @@ class MemoryGraph:
 
         return self.graph.subgraph(nodes).copy()
 
-    # ── Observability ──────────────────────────────────────────────────────
+    # -- Quality metrics --
 
     def get_metrics(self) -> dict:
-        """Return extraction and graph quality metrics."""
+        """Compute a bunch of stats about the graph for monitoring quality."""
         entity_types = Counter()
         relation_types = Counter()
         evidence_counts = []
@@ -211,7 +204,7 @@ class MemoryGraph:
         }
 
     def print_metrics(self):
-        """Pretty-print quality metrics."""
+        """Print out a nice summary of the graph's quality metrics."""
         metrics = self.get_metrics()
         print("\n" + "=" * 60)
         print("MEMORY GRAPH OBSERVABILITY REPORT")
@@ -225,12 +218,12 @@ class MemoryGraph:
                 print(f"    {data}")
         print("=" * 60)
 
-    # ── Serialization ──────────────────────────────────────────────────────
+    # -- Save and load --
 
     def save(self, path: str):
-        """Serialize graph to JSON."""
+        """Write the graph out to a JSON file."""
         data = nx.node_link_data(self.graph)
-        # Include metrics
+        # stash our tracking data alongside the graph
         data["_metrics"] = self._metrics
         data["_ingested_entity_ids"] = list(self._ingested_entity_ids)
         data["_ingested_claim_ids"] = list(self._ingested_claim_ids)
@@ -240,7 +233,7 @@ class MemoryGraph:
 
     @classmethod
     def load(cls, path: str) -> "MemoryGraph":
-        """Load graph from JSON."""
+        """Read a graph back from a saved JSON file."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -253,7 +246,7 @@ class MemoryGraph:
 
 
 def build_graph(store_path: str, output_path: str) -> MemoryGraph:
-    """Build graph from deduped MemoryStore."""
+    """Create the graph from a deduplicated MemoryStore and save it."""
     store = MemoryStore.deserialize(store_path)
 
     mg = MemoryGraph()

@@ -1,15 +1,8 @@
 """
-Structured extraction pipeline using Ollama (local LLM).
-
-Takes raw Enron email data and extracts typed, grounded objects
-(entities + claims + evidence) using a local model.
-
-Features:
-- Strict Pydantic validation with auto-repair loop
-- Evidence grounding with exact quotes and character offsets
-- Quality gates (confidence threshold, cross-evidence support)
-- Extraction versioning
-- Checkpoint/resume support for long runs
+Extraction pipeline — uses Ollama (local LLM) to pull structured info out of raw Enron emails.
+We feed each email message to the model and get back typed entities and claims, all grounded
+with exact quotes from the source. Pydantic handles validation, and we checkpoint progress
+so we can pick up where we left off if something crashes.
 """
 
 import hashlib
@@ -28,8 +21,8 @@ from schema import (
 
 EXTRACTION_VERSION = "v1"
 MODEL_NAME = "llama3.1"
-CONFIDENCE_THRESHOLD = 0.5   # quality gate: discard claims below this
-MAX_RETRIES = 3              # auto-repair attempts for invalid JSON
+CONFIDENCE_THRESHOLD = 0.5
+MAX_RETRIES = 3
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 SYSTEM_PROMPT = """You are an information extraction engine for corporate emails. Extract entities and claims as JSON.
@@ -51,13 +44,13 @@ Return ONLY this JSON structure:
 
 
 def make_extraction_prompt(issue_title: str, comment: dict, issue_id: int) -> str:
-    """Build the user prompt for a single email message extraction."""
+    """Put together the prompt we send to the LLM for one email message."""
     source_id = comment["comment_id"]
     text = comment["text"]
     author = comment["author"]
     timestamp = comment["timestamp"]
 
-    # Truncate very long messages to avoid context overflow
+    # chop overly long messages so we don't blow the context window
     if len(text) > 3000:
         text = text[:3000] + "... [truncated]"
 
@@ -70,7 +63,7 @@ TIMESTAMP: {timestamp}
 
 
 def call_ollama(prompt: str, attempt: int = 0) -> dict:
-    """Call Ollama and parse JSON response with auto-repair."""
+    """Send the prompt to Ollama and try to parse back valid JSON, retrying if needed."""
     try:
         response = ollama.chat(
             model=MODEL_NAME,
@@ -93,20 +86,19 @@ def call_ollama(prompt: str, attempt: int = 0) -> dict:
 
 
 def parse_json_response(raw_text: str) -> dict:
-    """Extract and parse JSON from LLM response, handling common issues."""
-    # Strip markdown code fences if present
+    """Try to pull valid JSON out of whatever the model gave us back."""
+    # strip markdown code fences the model sometimes wraps around its output
     text = raw_text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
 
-    # Try direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON object in the text
+    # sometimes there's extra text around the JSON — try to fish it out
     match = re.search(r"\{[\s\S]*\}", text)
     if match:
         try:
@@ -114,21 +106,19 @@ def parse_json_response(raw_text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # With format="json" in Ollama, output should always be valid JSON.
-    # If we still can't parse, return empty.
+    # nothing worked, just return empty so the pipeline keeps moving
     return {"entities": [], "claims": []}
 
 
 def validate_and_build(raw_data: dict, source_id: str, timestamp: str,
                        author: str, issue_id: int) -> ExtractionResult:
-    """Validate LLM output against Pydantic schema with repair."""
+    """Take the raw LLM output and turn it into proper validated Pydantic objects."""
     entities = []
     claims = []
 
-    # Process entities
     for raw_ent in raw_data.get("entities", []):
         try:
-            # Normalize entity type
+            # fall back to Concept if the model gave us a weird entity type
             etype = raw_ent.get("entity_type", "Concept")
             try:
                 etype = EntityType(etype)
@@ -150,17 +140,16 @@ def validate_and_build(raw_data: dict, source_id: str, timestamp: str,
         except Exception as e:
             print(f"    Skipping invalid entity: {e}")
 
-    # Process claims
     for raw_claim in raw_data.get("claims", []):
         try:
-            # Normalize relation
+            # default to related_to if the relation type isn't recognized
             rel = raw_claim.get("relation", "related_to")
             try:
                 rel = RelationType(rel)
             except ValueError:
                 rel = RelationType.RELATED_TO
 
-            # Build evidence with grounding
+            # build out the evidence objects for this claim
             evidences = []
             for raw_ev in raw_claim.get("evidence", []):
                 quote = raw_ev.get("exact_quote", "")
@@ -174,7 +163,7 @@ def validate_and_build(raw_data: dict, source_id: str, timestamp: str,
                 )
                 evidences.append(ev)
 
-            # If no evidence provided, skip (quality gate)
+            # no evidence means we can't ground it — skip
             if not evidences:
                 continue
 
@@ -184,7 +173,7 @@ def validate_and_build(raw_data: dict, source_id: str, timestamp: str,
 
             confidence = float(raw_claim.get("confidence", 0.7))
 
-            # Quality gate: skip low-confidence claims
+            # drop anything below our confidence threshold
             if confidence < CONFIDENCE_THRESHOLD:
                 continue
 
@@ -210,13 +199,13 @@ def validate_and_build(raw_data: dict, source_id: str, timestamp: str,
 
 
 def extract_issue(issue: dict) -> ExtractionResult:
-    """Extract entities and claims from all comments in an issue."""
+    """Run extraction on every message in a single email thread."""
     issue_id = issue["issue_id"]
     title = issue["title"]
     all_entities = []
     all_claims = []
 
-    # Sort comments chronologically for proper temporal ordering
+    # process messages in chronological order so timestamps make sense
     comments = sorted(issue["comments"], key=lambda c: c["timestamp"])
 
     for comment in comments:
@@ -242,13 +231,13 @@ def extract_issue(issue: dict) -> ExtractionResult:
 
 
 def run_extraction(corpus_path: str, output_path: str):
-    """Run extraction on the full corpus with checkpointing."""
+    """Go through every thread in the corpus and extract structured data, saving progress as we go."""
     with open(corpus_path, "r") as f:
         corpus = json.load(f)
 
     checkpoint_path = os.path.join(CHECKPOINT_DIR, "_extraction_checkpoint.json")
 
-    # Load checkpoint if exists
+    # pick up from where we left off if there's a checkpoint
     if os.path.exists(checkpoint_path):
         with open(checkpoint_path, "r") as f:
             checkpoint = json.load(f)
@@ -271,7 +260,6 @@ def run_extraction(corpus_path: str, output_path: str):
         print(f"[{idx+1}/{total}] Extracting issue #{iid}: {issue['title'][:60]}...")
         result = extract_issue(issue)
 
-        # Add to store
         for entity in result.entities:
             store.add_entity(entity)
         for claim in result.claims:
@@ -279,7 +267,7 @@ def run_extraction(corpus_path: str, output_path: str):
 
         completed.add(iid)
 
-        # Checkpoint
+        # save checkpoint after each thread so we can resume later
         checkpoint_data = {
             "store": json.loads(store.model_dump_json()),
             "completed_issues": list(completed),
@@ -289,10 +277,9 @@ def run_extraction(corpus_path: str, output_path: str):
 
         print(f"  Extracted {len(result.entities)} entities, {len(result.claims)} claims")
 
-    # Save final output
     store.serialize(output_path)
 
-    # Clean up checkpoint
+    # done — remove the checkpoint file since we finished everything
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
 

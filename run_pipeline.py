@@ -1,10 +1,11 @@
 """
-Main pipeline: runs all stages end-to-end.
+Runs the whole pipeline from start to finish: fetch data, extract, dedup, build graph,
+generate example queries, and copy everything to the outputs folder.
 
 Usage:
-    python run_pipeline.py              # Full pipeline
-    python run_pipeline.py --skip-fetch # Skip data download (if already done)
-    python run_pipeline.py --skip-extract # Skip extraction (if already done)
+    python run_pipeline.py              # run everything
+    python run_pipeline.py --skip-fetch # skip the download step
+    python run_pipeline.py --skip-extract # skip the LLM extraction step
 """
 
 import argparse
@@ -22,7 +23,7 @@ def ensure_dirs():
 
 
 def step_fetch():
-    """Step 1: Fetch Enron email corpus."""
+    """Download and process the Enron email corpus."""
     print("\n" + "=" * 60)
     print("STEP 1: FETCHING CORPUS (Enron Email Dataset)")
     print("=" * 60)
@@ -37,7 +38,7 @@ def step_fetch():
 
 
 def step_extract():
-    """Step 2: LLM-based structured extraction."""
+    """Run the LLM to pull entities and claims out of each email."""
     print("\n" + "=" * 60)
     print("STEP 2: STRUCTURED EXTRACTION (Ollama)")
     print("=" * 60)
@@ -51,7 +52,7 @@ def step_extract():
 
 
 def step_dedup():
-    """Step 3: Deduplication and canonicalization."""
+    """Clean up duplicates and merge equivalent entities."""
     print("\n" + "=" * 60)
     print("STEP 3: DEDUPLICATION & CANONICALIZATION")
     print("=" * 60)
@@ -69,7 +70,7 @@ def step_dedup():
 
 
 def step_graph():
-    """Step 4: Build memory graph."""
+    """Turn the deduped store into a proper NetworkX graph."""
     print("\n" + "=" * 60)
     print("STEP 4: BUILD MEMORY GRAPH")
     print("=" * 60)
@@ -81,7 +82,7 @@ def step_graph():
 
 
 def step_retrieval_examples():
-    """Step 5: Generate example context packs."""
+    """Run some sample queries to show off what the retrieval can do."""
     print("\n" + "=" * 60)
     print("STEP 5: GENERATE EXAMPLE CONTEXT PACKS")
     print("=" * 60)
@@ -93,7 +94,7 @@ def step_retrieval_examples():
 
 
 def step_serialize_outputs():
-    """Step 6: Copy final graph and store to outputs."""
+    """Copy the final files into the outputs directory for easy access."""
     print("\n" + "=" * 60)
     print("STEP 6: SERIALIZE OUTPUTS")
     print("=" * 60)

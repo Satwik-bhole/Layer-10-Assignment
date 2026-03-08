@@ -1,19 +1,8 @@
 """
-Download and process the Enron Email Dataset (CMU source).
-
-Corpus: Enron Email Dataset — email threads, forwarding/quoting, identity
-resolution challenges. As suggested in the assignment.
-
-Source: CMU Enron dataset (https://www.cs.cmu.edu/~enron/)
-Download: enron_mail_20150507.tar.gz (~1.7 GB)
-
-The script:
-1. Downloads the tar.gz from CMU (with resume support)
-2. Extracts only selected user mailboxes (saves disk space)
-3. Parses raw email files into structured messages
-4. Groups messages into conversation threads
-5. Selects 50-75 threads with 3+ messages each
-6. Saves as data/raw_corpus.json in the pipeline's expected format
+Handles downloading and processing the Enron Email Dataset from the CMU mirror.
+This grabs the big tar.gz, pulls out just the mailboxes we care about, parses
+the raw email files into something usable, groups them into conversation threads,
+and saves the result as our pipeline's input corpus.
 """
 
 import email
@@ -36,8 +25,8 @@ ENRON_EXTRACT_DIR = os.path.join(DATA_DIR, "enron_maildir")
 
 CMU_URL = "https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz"
 
-# Users with rich email threads — known active Enron correspondents
-# These cover: executive decisions, legal discussion, trading, research, policy
+# picked these folks because they had the most interesting and active threads
+# covers execs, legal, trading, research, gov affairs, and logistics
 TARGET_USERS = [
     "kaminski-v",    # Vince Kaminski — VP Research, technical + business
     "dasovich-j",    # Jeff Dasovich — Government Affairs, policy debates
@@ -48,16 +37,16 @@ TARGET_USERS = [
     "farmer-d",      # Daren Farmer — Logistics, scheduling threads
 ]
 
-# Folders within each user's mailbox to extract
+# which folders inside each person's mailbox to look at
 TARGET_FOLDERS = ["sent_items", "sent", "inbox", "all_documents", "_sent_mail"]
 
 MIN_MESSAGES_PER_THREAD = 5
 MAX_MESSAGES_PER_THREAD = 15
-TARGET_THREAD_COUNT = 15
+TARGET_THREAD_COUNT = 12
 
 
 def download_enron():
-    """Download the Enron tar.gz from CMU with resume support (pure Python)."""
+    """Grab the Enron tar.gz from CMU. Supports resuming partial downloads."""
     if os.path.exists(ENRON_TAR):
         size_mb = os.path.getsize(ENRON_TAR) / (1024 * 1024)
         if size_mb > 1500:
@@ -71,7 +60,7 @@ def download_enron():
     print()
 
     try:
-        # Resume support via Range header
+        # if we already have a partial file, pick up where we stopped
         headers = {}
         mode = "wb"
         downloaded = 0
@@ -105,7 +94,7 @@ def download_enron():
 
 
 def extract_mailboxes():
-    """Extract only the target users' mailboxes from the tar.gz (pure Python)."""
+    """Pull out just the mailboxes we want from the big tar.gz archive."""
     if os.path.exists(ENRON_EXTRACT_DIR) and any(
         os.path.isdir(os.path.join(ENRON_EXTRACT_DIR, u))
         for u in TARGET_USERS
@@ -117,7 +106,7 @@ def extract_mailboxes():
 
     os.makedirs(ENRON_EXTRACT_DIR, exist_ok=True)
 
-    # Prefixes to match inside the tar: maildir/<user>/
+    # these are the path prefixes we're looking for inside the archive
     target_prefixes = tuple(f"maildir/{u}/" for u in TARGET_USERS)
 
     print(f"  Extracting {len(TARGET_USERS)} user mailboxes...")
@@ -128,9 +117,9 @@ def extract_mailboxes():
             for member in tar:
                 if not member.name.startswith(target_prefixes):
                     continue
-                # Strip "maildir/" prefix (equivalent to --strip-components=1)
+                # chop off the "maildir/" prefix so the files land in the right spot
                 member.name = member.name[len("maildir/"):]
-                # Security: skip absolute paths or path traversal
+                # safety check — don't let anything escape the target directory
                 if member.name.startswith(("/", "..")) or ".." in member.name:
                     continue
                 tar.extract(member, path=ENRON_EXTRACT_DIR, filter="data")
@@ -157,14 +146,14 @@ def extract_mailboxes():
 
 
 def parse_email_file(filepath: str) -> dict:
-    """Parse a single raw email file into a structured dict."""
+    """Read one raw email file and pull out the useful bits into a dict."""
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             msg = email.message_from_file(f, policy=email.policy.default)
     except Exception:
         return None
 
-    # Extract headers
+    # grab the important headers
     msg_id = msg.get("Message-ID", "")
     sender = msg.get("From", "unknown")
     to_raw = msg.get("To", "")
@@ -174,7 +163,7 @@ def parse_email_file(filepath: str) -> dict:
     in_reply_to = msg.get("In-Reply-To", "")
     references = msg.get("References", "")
 
-    # Parse body
+    # get the actual email body text
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -191,7 +180,7 @@ def parse_email_file(filepath: str) -> dict:
     if not body.strip():
         return None
 
-    # Parse date to ISO format
+    # try to convert the date into ISO format
     timestamp = ""
     if date_str:
         try:
@@ -201,11 +190,10 @@ def parse_email_file(filepath: str) -> dict:
         except Exception:
             timestamp = date_str
 
-    # Parse recipient lists
+    # split out the recipient email addresses
     def parse_addrs(raw):
         if not raw:
             return []
-        # Handle comma-separated email addresses
         addrs = [a.strip() for a in str(raw).split(",")]
         return [a for a in addrs if a and "@" in a]
 
@@ -226,7 +214,7 @@ def parse_email_file(filepath: str) -> dict:
 
 
 def collect_all_emails() -> list[dict]:
-    """Walk extracted mailboxes and parse all email files."""
+    """Walk through all extracted mailboxes and parse every email we find."""
     all_emails = []
     seen_ids = set()
 
@@ -259,9 +247,9 @@ def collect_all_emails() -> list[dict]:
 
 
 def normalize_subject(subject: str) -> str:
-    """Normalize subject line for thread grouping."""
+    """Clean up the subject line so we can group related emails together."""
     s = subject.strip()
-    # Remove Re:/Fwd:/FW:/RE: prefixes (possibly repeated)
+    # strip off Re:/Fwd:/FW: prefixes that pile up in reply chains
     s = re.sub(r"^(Re|Fwd|FW|RE|Fw):\s*", "", s, flags=re.IGNORECASE)
     s = re.sub(r"^(Re|Fwd|FW|RE|Fw):\s*", "", s, flags=re.IGNORECASE)
     s = re.sub(r"^(Re|Fwd|FW|RE|Fw):\s*", "", s, flags=re.IGNORECASE)
@@ -270,20 +258,19 @@ def normalize_subject(subject: str) -> str:
 
 
 def group_into_threads(emails: list[dict]) -> list[list[dict]]:
-    """Group emails into conversation threads by subject + reply chains."""
-    # Build reply map: message_id -> email
+    """Group emails into conversation threads based on their subject lines."""
     by_id = {}
     for em in emails:
         by_id[em["message_id"]] = em
 
-    # Phase 1: Group by normalized subject
+    # bucket emails by their cleaned-up subject line
     subject_groups = defaultdict(list)
     for em in emails:
         norm_subj = normalize_subject(em["subject"])
         if norm_subj:
             subject_groups[norm_subj].append(em)
 
-    # Phase 2: Sort each group chronologically
+    # sort each thread by time so the conversation flows correctly
     threads = []
     for subj, group in subject_groups.items():
         group.sort(key=lambda e: e.get("timestamp", ""))
@@ -294,16 +281,17 @@ def group_into_threads(emails: list[dict]) -> list[list[dict]]:
 
 def build_corpus(threads: list[list[dict]]) -> list[dict]:
     """
-    Convert email threads into the pipeline's expected corpus format.
-    Each thread becomes an "issue" with "comments".
+    Turn email threads into the format our pipeline expects.
+    Each thread becomes an 'issue' with 'comments' — maps nicely to the
+    same structure we'd get from GitHub issues or Jira tickets.
     """
-    # Filter: keep threads with MIN..MAX messages (avoids mega-threads)
+    # only keep threads that hit our message count sweet spot
     good_threads = [
         t for t in threads
         if MIN_MESSAGES_PER_THREAD <= len(t) <= MAX_MESSAGES_PER_THREAD
     ]
 
-    # Sort by thread length (most emails first), take TARGET_THREAD_COUNT
+    # grab the biggest threads first, up to our target count
     good_threads.sort(key=lambda t: len(t), reverse=True)
     good_threads = good_threads[:TARGET_THREAD_COUNT]
 
@@ -312,10 +300,10 @@ def build_corpus(threads: list[list[dict]]) -> list[dict]:
         thread_id = idx + 1
         subject = thread[0]["subject"]
 
-        # Cap thread length
+        # trim the thread if it somehow exceeds our max
         thread = thread[:MAX_MESSAGES_PER_THREAD]
 
-        # Build comments from each email in thread
+        # turn each email into a "comment" in our format
         comments = []
         for i, em in enumerate(thread):
             comments.append({
@@ -326,12 +314,12 @@ def build_corpus(threads: list[list[dict]]) -> list[dict]:
                 "is_issue_body": (i == 0),
             })
 
-        # Determine thread time range
+        # figure out the time range for this thread
         timestamps = [em["timestamp"] for em in thread if em["timestamp"]]
         created_at = min(timestamps) if timestamps else ""
         closed_at = max(timestamps) if timestamps else ""
 
-        # Collect unique participants
+        # collect everyone who participated
         participants = set()
         for em in thread:
             participants.add(em["sender"])
@@ -355,7 +343,7 @@ def build_corpus(threads: list[list[dict]]) -> list[dict]:
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # Check if corpus already exists
+    # no need to redo everything if we already have the corpus
     if os.path.exists(OUTPUT_PATH):
         with open(OUTPUT_PATH) as f:
             existing = json.load(f)
@@ -369,25 +357,25 @@ def main():
     print(f"URL: {CMU_URL}")
     print()
 
-    # Step 1: Download
+    # step 1: download the dataset
     print("[Step 1/4] Downloading Enron Email Dataset...")
     if not download_enron():
         sys.exit(1)
 
-    # Step 2: Extract mailboxes
+    # step 2: unpack only the mailboxes we need
     print(f"\n[Step 2/4] Extracting {len(TARGET_USERS)} user mailboxes...")
     if not extract_mailboxes():
         print("  Failed to extract mailboxes.")
         sys.exit(1)
 
-    # Step 3: Parse emails
+    # step 3: parse all the raw email files
     print(f"\n[Step 3/4] Parsing emails...")
     all_emails = collect_all_emails()
     if len(all_emails) < 50:
         print(f"  Only {len(all_emails)} emails found. Need more data.")
         sys.exit(1)
 
-    # Step 4: Thread and build corpus
+    # step 4: group into conversation threads and package it up
     print(f"\n[Step 4/4] Grouping into threads and building corpus...")
     threads = group_into_threads(all_emails)
     print(f"  Found {len(threads)} threads total")

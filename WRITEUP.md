@@ -18,8 +18,8 @@ This system turns scattered corporate email communications (the **Enron Email Da
 **Source**: Enron Email Dataset (CMU mirror)  
 **Obtained via**: `fetch_corpus.py` — downloads from `https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz`  
 **Selection**: 7 active Enron employees' mailboxes (kaminski-v, dasovich-j, mann-k, shackleton-s, lay-k, germany-c, farmer-d) — covering executive decisions, legal discussions, energy trading, government affairs, and logistics  
-**Processing**: Emails are parsed with Python's `email` module, grouped into conversation threads by normalized subject line, then filtered to threads with 3+ messages  
-**Total**: 50–75 email threads with multiple messages each, producing rich multi-party discussion data
+**Processing**: Emails are parsed with Python's `email` module, grouped into conversation threads by normalized subject line, then filtered to threads with 12–15 messages  
+**Total**: 12 email threads with 12–15 messages each, producing rich multi-party discussion data
 
 ### Why Enron?
 The Enron Email Dataset is explicitly suggested by the assignment as a corpus that exercises:
@@ -341,7 +341,7 @@ streamlit run app.py
 ```
 
 ### Output Files
-- `data/raw_corpus.json` — Raw corpus (50–75 email threads, hundreds of messages)
+- `data/raw_corpus.json` — Raw corpus (12 email threads, 12–15 messages each)
 - `data/extracted_raw.json` — Raw extraction output (entities + claims)
 - `data/deduped_store.json` — Deduplicated memory store
 - `data/memory_graph.json` — Serialized NetworkX graph

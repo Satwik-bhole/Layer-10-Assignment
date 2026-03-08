@@ -46,6 +46,6 @@ fetch_corpus.py  →  extraction.py  →  deduplication.py  →  graph.py  →  
 
 ## Corpus
 
-**Enron Email Dataset** (CMU mirror) — 50–75 email threads from 7 active Enron employees' mailboxes, covering executive decisions, legal discussions, energy trading, government affairs, and logistics. Parsed, threaded, and filtered from the original maildir format.
+**Enron Email Dataset** (CMU mirror) — 12 email threads from 7 active Enron employees' mailboxes, covering executive decisions, legal discussions, energy trading, government affairs, and logistics. Parsed, threaded, and filtered from the original maildir format.
 
 See [WRITEUP.md](WRITEUP.md) for full details.

@@ -1,15 +1,7 @@
 """
-Retrieval and grounding API.
-
-Given a natural language question, returns a grounded Context Pack:
-ranked evidence snippets + linked entities/claims, all traceable to source.
-
-Approach:
-1. Embed the query using the same sentence-transformer model
-2. Find matching entities (keyword + semantic)
-3. Traverse graph neighbors to gather relevant claims
-4. Pack claims with evidence, sorted by relevance/recency/confidence
-5. Optionally generate an answer via Ollama grounded in the context pack
+Retrieval engine — takes a natural language question, finds relevant entities
+and claims in the graph, and packages everything up into a grounded context pack.
+Answers always come with the source emails to back them up.
 """
 
 import json
@@ -27,7 +19,7 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 @dataclass
 class ContextItem:
-    """A single item in the context pack."""
+    """One claim with its evidence, ready to be shown to the user or fed to an LLM."""
     claim_id: str
     subject: str
     relation: str
@@ -42,7 +34,7 @@ class ContextItem:
 
 @dataclass
 class ContextPack:
-    """A ranked collection of context items with grounding."""
+    """A ranked bundle of claims and evidence that answers a query."""
     query: str
     matched_entities: list[dict] = field(default_factory=list)
     items: list[ContextItem] = field(default_factory=list)
@@ -69,7 +61,7 @@ class ContextPack:
         }
 
     def format_for_llm(self) -> str:
-        """Format context pack as text for the LLM to use."""
+        """Turn the context pack into plain text that an LLM can reason over."""
         lines = [f"CONTEXT FOR QUERY: {self.query}\n"]
 
         if self.matched_entities:
@@ -99,7 +91,7 @@ class ContextPack:
 
 
 class Retriever:
-    """Retrieval engine: question -> grounded context pack."""
+    """Handles the whole flow from question to grounded context pack."""
 
     def __init__(self, graph: MemoryGraph):
         self.graph = graph
@@ -110,7 +102,7 @@ class Retriever:
         self._build_index()
 
     def _build_index(self):
-        """Pre-compute embeddings for all entity names."""
+        """Pre-compute embeddings for every entity name and alias so search is fast."""
         print("Building retrieval index...")
         names = []
         ids = []
@@ -119,7 +111,7 @@ class Retriever:
             if name:
                 names.append(name)
                 ids.append(nid)
-                # Also index aliases
+                # index aliases too so we can match on those
                 for alias in data.get("aliases", []):
                     names.append(alias)
                     ids.append(nid)
@@ -133,13 +125,13 @@ class Retriever:
 
     def _find_matching_entities(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
         """
-        Find entities matching the query via keyword + semantic search.
-        Returns list of (entity_id, score) tuples.
+        Find entities that match the query using both keyword and semantic search.
+        Returns (entity_id, score) pairs ranked by relevance.
         """
         if self._embedding_matrix is None or len(self._node_ids) == 0:
             return []
 
-        # Keyword matches
+        # first, quick keyword matching against names and aliases
         keyword_matches = set()
         for nid, data in self.graph.graph.nodes(data=True):
             name = data.get("name", "").lower()
@@ -149,11 +141,11 @@ class Retriever:
                 if len(word) >= 3 and (word in name or any(word in a for a in aliases)):
                     keyword_matches.add(nid)
 
-        # Semantic matches
+        # then, semantic similarity using embeddings for fuzzier matching
         query_emb = self.model.encode([query], normalize_embeddings=True)
         similarities = np.dot(self._embedding_matrix, query_emb.T).flatten()
 
-        # Combine keyword + semantic scores
+        # blend the two approaches together
         entity_scores = {}
         for idx in np.argsort(similarities)[::-1][:top_k * 3]:
             nid = self._node_ids[idx]
@@ -161,32 +153,25 @@ class Retriever:
             if nid not in entity_scores or score > entity_scores[nid]:
                 entity_scores[nid] = score
 
-        # Boost keyword matches
+        # give keyword matches a nice boost since exact matches are usually what people want
         for nid in keyword_matches:
             entity_scores[nid] = entity_scores.get(nid, 0.3) + 0.3
 
-        # Sort by score and take top_k unique entities
+        # take the best unique entities
         ranked = sorted(entity_scores.items(), key=lambda x: x[1], reverse=True)
         return ranked[:top_k]
 
     def retrieve(self, query: str, top_k: int = 10,
                  include_historical: bool = True) -> ContextPack:
-        """
-        Retrieve a grounded context pack for a query.
-
-        Args:
-            query: Natural language question
-            top_k: Max number of claims to return
-            include_historical: Whether to include superseded claims
-        """
+        """The main retrieval method — give it a question, get back a grounded context pack."""
         pack = ContextPack(query=query)
 
-        # Step 1: Find matching entities
+        # find which entities are relevant to the question
         entity_matches = self._find_matching_entities(query, top_k=5)
         if not entity_matches:
             return pack
 
-        # Record matched entities
+        # record what we matched for transparency
         for nid, score in entity_matches:
             node_data = self.graph.get_node(nid)
             if node_data:
@@ -198,7 +183,7 @@ class Retriever:
                     "match_score": round(score, 3),
                 })
 
-        # Step 2: Gather claims from matched entities
+        # pull in all claims connected to matching entities
         seen_claims = set()
         raw_items = []
 
@@ -214,13 +199,13 @@ class Retriever:
                 if not include_historical and not is_current:
                     continue
 
-                # Get readable names for subject/object
+                # look up human-readable names for the entities in this claim
                 subj_data = self.graph.get_node(edge["subject_id"])
                 obj_data = self.graph.get_node(edge["object_id"])
                 subject_name = subj_data.get("name", edge["subject_id"]) if subj_data else edge["subject_id"]
                 object_name = obj_data.get("name", edge["object_id"]) if obj_data else edge["object_id"]
 
-                # Compute relevance score: entity_score * confidence * recency_boost
+                # score = how well the entity matched * claim confidence * freshness bonus
                 confidence = edge.get("confidence", 0.5)
                 recency_boost = 1.2 if is_current else 0.8
                 relevance = entity_score * confidence * recency_boost
@@ -239,17 +224,14 @@ class Retriever:
                 )
                 raw_items.append(item)
 
-        # Step 3: Rank by relevance and prune
+        # rank everything and keep the best ones
         raw_items.sort(key=lambda x: x.relevance_score, reverse=True)
         pack.items = raw_items[:top_k]
 
         return pack
 
     def answer_question(self, query: str, top_k: int = 10) -> tuple[str, ContextPack]:
-        """
-        Answer a question using the graph + Ollama.
-        Returns (answer, context_pack).
-        """
+        """Answer a question by retrieving context from the graph and having Ollama generate a response."""
         import ollama as ollama_client
 
         pack = self.retrieve(query, top_k=top_k)
@@ -284,7 +266,7 @@ ANSWER (cite sources):"""
 
 
 def generate_example_context_packs(graph_path: str, output_path: str):
-    """Generate example context packs for a set of sample questions."""
+    """Run a few sample queries and save the results so we can show them off."""
     mg = MemoryGraph.load(graph_path)
     retriever = Retriever(mg)
 

@@ -1,16 +1,13 @@
 """
 Deduplication and canonicalization pipeline.
 
-Handles three levels of dedup as required:
-1. Artifact dedup: near-identical source texts (quoted replies, cross-posts)
-2. Entity canonicalization: merging entities that refer to the same thing
-   - Exact match (lowercase, strip)
-   - Semantic match (embedding similarity > 0.90)
-3. Claim dedup: merging repeated assertions while preserving all evidence
+Deals with three kinds of duplicate data that show up in email corpora:
+  1. Artifact dedup — near-identical texts from quoted replies and forwards
+  2. Entity canonicalization — merging different names for the same thing
+  3. Claim dedup — combining repeated assertions while keeping all evidence
 
-Also handles:
-- Conflict resolution with temporal validity (valid_from / valid_until)
-- Reversibility: full merge audit log with original snapshots for undo
+Also handles temporal conflict resolution (which version of a fact is current)
+and keeps a full merge audit log so any merge can be reversed.
 """
 
 import hashlib
@@ -47,13 +44,13 @@ class Deduplicator:
             self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
             print("Embedding model loaded.")
 
-    # ── Union-Find ─────────────────────────────────────────────────────────
+    # -- Union-Find helpers (for grouping entities that should merge) --
 
     def _find(self, x: str) -> str:
         if x not in self._parent:
             self._parent[x] = x
         while self._parent[x] != x:
-            self._parent[x] = self._parent[self._parent[x]]  # path compression
+            self._parent[x] = self._parent[self._parent[x]]  # path compression to keep it fast
             x = self._parent[x]
         return x
 
@@ -62,14 +59,13 @@ class Deduplicator:
         if ra != rb:
             self._parent[rb] = ra
 
-    # ── 1. Artifact Dedup ──────────────────────────────────────────────────
+    # -- Artifact Dedup --
 
     def dedup_artifacts(self, corpus: list[dict]) -> list[dict]:
         """
-        Remove near-duplicate source texts (quoted replies, forwarded content).
-        Handles email-specific quoting: '>' prefixed lines, '--- Original Message ---',
-        '-----Forwarded by...', signature blocks, and multi-level quoting.
-        Uses text fingerprinting to detect >80% overlap.
+        Spot and flag near-duplicate message texts. Emails get quoted and
+        forwarded all the time, so we strip out the quoted junk, fingerprint
+        what's left, and mark duplicates.
         """
         print("Deduplicating artifacts...")
         seen_fingerprints = {}
@@ -81,31 +77,31 @@ class Deduplicator:
                 text = comment.get("text", "")
                 # Normalize: strip email quoting artifacts
                 clean_text = text
-                # Remove '>' quoted lines (multi-level)
+                # get rid of '>' quoted lines from replies
                 clean_text = re.sub(
                     r"^>+.*$", "", clean_text, flags=re.MULTILINE)
-                # Remove "--- Original Message ---" blocks and everything after
+                # chop off everything after "--- Original Message ---"
                 clean_text = re.sub(
                     r"-{2,}\s*Original Message\s*-{2,}.*",
                     "", clean_text, flags=re.DOTALL | re.IGNORECASE
                 )
-                # Remove "-----Forwarded by..." blocks and everything after
+                # same for forwarded-by blocks
                 clean_text = re.sub(
                     r"-{2,}\s*Forwarded by.*",
                     "", clean_text, flags=re.DOTALL | re.IGNORECASE
                 )
-                # Remove common email signature markers
+                # strip email signatures (the -- marker)
                 clean_text = re.sub(
                     r"\n--\s*\n.*", "", clean_text, flags=re.DOTALL
                 )
-                # Normalize whitespace
+                # collapse whitespace
                 clean_text = re.sub(r"\s+", " ", clean_text).strip()
 
                 if len(clean_text) < 20:
                     unique_comments.append(comment)
                     continue
 
-                # Fingerprint using normalized text hash
+                # hash the cleaned text to quickly spot duplicates
                 fp = hashlib.md5(clean_text.lower().encode()).hexdigest()
 
                 if fp in seen_fingerprints:
@@ -122,13 +118,13 @@ class Deduplicator:
         print(f"  Found {dedup_count} artifact duplicates.")
         return corpus
 
-    # ── 2. Entity Canonicalization ─────────────────────────────────────────
+    # -- Entity Canonicalization --
 
     def canonicalize_entities(self):
         """
-        Merge entities that refer to the same real-world thing.
-        Phase 1: Exact match (lowercased, stripped)
-        Phase 2: Semantic similarity via embeddings
+        Merge entities that are really the same thing but got extracted with
+        different names. First pass does exact matching (case-insensitive),
+        second pass uses embedding similarity to catch fuzzy matches.
         """
         self._load_embedding_model()
         entities = list(self.store.entities.values())
@@ -141,7 +137,7 @@ class Deduplicator:
         for e in entities:
             self._parent[e.id] = e.id
 
-        # Phase 1: Exact match on normalized name + type
+        # first pass: group by exact name+type match
         exact_groups = defaultdict(list)
         for e in entities:
             key = f"{e.entity_type.value}::{e.name.lower().strip()}"
@@ -156,7 +152,7 @@ class Deduplicator:
                     exact_merges += 1
         print(f"  Exact match merges: {exact_merges}")
 
-        # Phase 2: Semantic similarity (within same type)
+        # second pass: use embeddings to catch semantically similar entities
         type_groups = defaultdict(list)
         for e in entities:
             type_groups[e.entity_type].append(e)
@@ -165,7 +161,7 @@ class Deduplicator:
         for etype, group in type_groups.items():
             if len(group) < 2:
                 continue
-            # Skip User type — usernames are exact, not semantic
+            # user names/emails are already exact identifiers, skip semantic matching
             if etype == EntityType.USER:
                 continue
 
@@ -175,7 +171,7 @@ class Deduplicator:
 
             for i in range(len(group)):
                 for j in range(i + 1, len(group)):
-                    # Only compare if not already merged
+                    # no point comparing if they're already in the same group
                     if self._find(group[i].id) == self._find(group[j].id):
                         continue
                     sim = float(np.dot(embeddings[i], embeddings[j]))
@@ -185,12 +181,12 @@ class Deduplicator:
 
         print(f"  Semantic similarity merges: {semantic_merges}")
 
-        # Apply merges: build canonical entities
+        # now actually apply all the merges we found
         self._apply_entity_merges()
 
     def _apply_entity_merges(self):
-        """Apply union-find results to create canonical entities."""
-        # Group entities by their root
+        """Take the union-find results and build the final merged entity list."""
+        # figure out which entities ended up in the same group
         groups = defaultdict(list)
         for eid in list(self.store.entities.keys()):
             root = self._find(eid)
@@ -205,18 +201,18 @@ class Deduplicator:
             if not members:
                 continue
 
-            # Pick the canonical: prefer the one with the shortest name, or first seen
+            # pick the entity with the shortest name as the canonical one
             canonical = min(members, key=lambda e: (
                 len(e.name), e.first_seen or ""))
 
-            # Collect all aliases
+            # gather up all the different names into aliases
             all_aliases = set()
             for m in members:
                 all_aliases.add(m.name)
                 all_aliases.update(m.aliases)
             all_aliases.discard(canonical.name)
 
-            # Earliest first_seen
+            # use the earliest timestamp we've seen for any of these entities
             first_seen_times = [m.first_seen for m in members if m.first_seen]
             earliest = min(first_seen_times) if first_seen_times else None
 
@@ -229,11 +225,11 @@ class Deduplicator:
             )
             new_entities[canonical.id] = merged
 
-            # Record mapping for all members
+            # remember which old IDs point to which canonical ID
             for mid in member_ids:
                 id_mapping[mid] = canonical.id
 
-            # Record merge in audit log (if >1 member)
+            # log the merge so we can undo it later if needed
             if len(member_ids) > 1:
                 original_snapshots = {
                     mid: self.store.entities[mid].model_dump()
@@ -251,22 +247,21 @@ class Deduplicator:
                 )
                 self.store.merge_log.append(record)
 
-        # Update store entities
         self.store.entities = new_entities
 
-        # Update claim references
+        # update all claims to point to the new canonical entity IDs
         for cid, claim in self.store.claims.items():
             if claim.subject_id in id_mapping:
                 claim.subject_id = id_mapping[claim.subject_id]
             if claim.object_id in id_mapping:
                 claim.object_id = id_mapping[claim.object_id]
 
-    # ── 3. Claim Deduplication ─────────────────────────────────────────────
+    # -- Claim Deduplication --
 
     def dedup_claims(self):
         """
-        Merge claims with the same (subject, relation, object) triple.
-        Combine their evidence lists, keeping all source pointers.
+        When multiple emails say the same thing (same subject-relation-object triple),
+        merge them into one claim but keep all the evidence from each.
         """
         print(f"Deduplicating {len(self.store.claims)} claims...")
 
@@ -283,11 +278,11 @@ class Deduplicator:
                 new_claims[group[0].id] = group[0]
                 continue
 
-            # Sort by timestamp (earliest first)
+            # keep the earliest one as the base and merge the rest in
             group.sort(key=lambda c: c.valid_from or "")
             canonical = group[0]
 
-            # Merge evidence from all duplicates
+            # combine all the evidence from every duplicate
             all_evidence = []
             seen_evidence_ids = set()
             for claim in group:
@@ -297,7 +292,7 @@ class Deduplicator:
                         all_evidence.append(ev)
                         seen_evidence_ids.add(ev_id)
 
-            # Take highest confidence
+            # use the best confidence score from any of the duplicates
             max_confidence = max(c.confidence for c in group)
 
             merged = Claim(
@@ -315,7 +310,7 @@ class Deduplicator:
             new_claims[merged.id] = merged
             merge_count += len(group) - 1
 
-            # Audit log
+            # keep a record of what we merged for transparency
             if len(group) > 1:
                 record = MergeRecord(
                     merge_id=str(uuid.uuid4())[:8],
@@ -334,25 +329,22 @@ class Deduplicator:
         print(
             f"  Merged {merge_count} duplicate claims. {len(new_claims)} unique remain.")
 
-    # ── 4. Conflict Resolution (Temporal) ──────────────────────────────────
+    # -- Temporal Conflict Resolution --
 
     def resolve_conflicts(self):
         """
-        Detect contradicting claims and apply temporal validity.
-        E.g., "issue is open" at T1 vs "issue is closed" at T2:
-          - Mark T1 claim with valid_until=T2, is_current=False
-          - Mark T2 claim as is_current=True
+        When we have contradicting claims (like "issue is open" then later "issue is
+        closed"), mark the older one as historical and the newer one as current.
         """
         print("Resolving temporal conflicts...")
 
-        # Group claims by (subject, relation) — same subject+relation with
-        # different objects indicates potential conflict
+        # group claims by subject + relation to find potential conflicts
         sr_groups = defaultdict(list)
         for claim in self.store.claims.values():
             key = f"{claim.subject_id}::{claim.relation.value}"
             sr_groups[key].append(claim)
 
-        # Relations that are typically single-valued (conflicts possible)
+        # these relations can only have one true value at a time
         single_valued_relations = {
             RelationType.STATUS_CHANGED,
             RelationType.ASSIGNED_TO,
@@ -365,20 +357,20 @@ class Deduplicator:
             if len(group) < 2:
                 continue
 
-            # Check if any claims in this group have different objects
+            # see if claims in this group point to different objects (= conflict)
             objects = set(c.object_id for c in group)
             if len(objects) <= 1:
                 continue
 
-            # Check if the relation type suggests single-valued
+            # only flag conflicts for relations where there should be one answer
             relation = group[0].relation
             if relation not in single_valued_relations:
                 continue
 
-            # Sort chronologically
+            # line them up by time
             group.sort(key=lambda c: c.valid_from or "")
 
-            # Mark earlier claims as superseded
+            # older claims get marked as superseded by newer ones
             for i in range(len(group) - 1):
                 older = group[i]
                 newer = group[i + 1]
@@ -387,15 +379,15 @@ class Deduplicator:
                     older.is_current = False
                     conflicts_resolved += 1
 
-            # Latest claim is current
+            # the most recent one wins
             group[-1].is_current = True
 
         print(f"  Resolved {conflicts_resolved} temporal conflicts.")
 
-    # ── Main pipeline ──────────────────────────────────────────────────────
+    # -- Run everything --
 
     def run_full_pipeline(self):
-        """Run all dedup stages in order."""
+        """Run all the dedup stages in the right order."""
         print(f"\n{'='*60}")
         print("DEDUPLICATION & CANONICALIZATION PIPELINE")
         print(f"{'='*60}")
@@ -406,7 +398,7 @@ class Deduplicator:
         self.dedup_claims()
         self.resolve_conflicts()
 
-        # Remove orphan claims (referencing entities that don't exist)
+        # clean up any claims that reference entities we don't have anymore
         valid_entity_ids = set(self.store.entities.keys())
         orphan_count = 0
         clean_claims = {}
@@ -430,8 +422,8 @@ class Deduplicator:
 
 def undo_merge(store: MemoryStore, merge_id: str) -> MemoryStore:
     """
-    Reverse a merge operation using the audit log.
-    Returns the store with the merge undone.
+    Roll back a specific merge using the snapshots we saved in the audit log.
+    Puts the original entities/claims back the way they were.
     """
     record = None
     for r in store.merge_log:

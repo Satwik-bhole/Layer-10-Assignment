@@ -1,13 +1,7 @@
 """
-Streamlit visualization app for the Memory Graph.
-
-Features:
-- Interactive graph visualization via pyvis
-- Chat interface for querying the graph
-- Evidence panel: click a claim to see exact source quotes
-- Inspect duplicates/merges (aliases, merged entities, merged claims)
-- Filter by time, relation type, confidence
-- Observability dashboard with quality metrics
+Streamlit app for exploring the memory graph interactively.
+You can visualize the graph, ask questions, drill into evidence for any claim,
+inspect which entities got merged, and check quality metrics.
 """
 
 import json
@@ -18,15 +12,15 @@ import networkx as nx
 import streamlit as st
 from pyvis.network import Network
 
-# Must be first Streamlit call
-st.set_page_config(page_title="Memory Graph Explorer", layout="wide")
+# this has to be the very first Streamlit call
+st.set_page_config(page_title="Layer10 Memory Graph Explorer", layout="wide")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 GRAPH_PATH = os.path.join(DATA_DIR, "memory_graph.json")
 STORE_PATH = os.path.join(DATA_DIR, "deduped_store.json")
 
 
-# ── Caching ────────────────────────────────────────────────────────────────────
+# -- Cache the expensive stuff so we only load once --
 
 @st.cache_resource
 def load_graph():
@@ -47,7 +41,7 @@ def load_retriever():
     return Retriever(mg)
 
 
-# ── Color map for entity types ─────────────────────────────────────────────────
+# -- Colors for the different entity and relation types in the graph --
 
 ENTITY_COLORS = {
     "User": "#4CAF50",
@@ -83,10 +77,10 @@ RELATION_COLORS = {
 }
 
 
-# ── Pyvis graph rendering ─────────────────────────────────────────────────────
+# -- Graph rendering with pyvis --────
 
 def render_pyvis_graph(subgraph: nx.MultiDiGraph, height: str = "600px"):
-    """Render a NetworkX subgraph as an interactive pyvis HTML graph."""
+    """Turn a NetworkX graph into an interactive HTML visualization using pyvis."""
     net = Network(
         height=height,
         width="100%",
@@ -95,7 +89,7 @@ def render_pyvis_graph(subgraph: nx.MultiDiGraph, height: str = "600px"):
         font_color="white",
     )
 
-    # Physics settings for better layout
+    # tweak the physics so the graph looks decent
     net.set_options(json.dumps({
         "physics": {
             "forceAtlas2Based": {
@@ -113,7 +107,7 @@ def render_pyvis_graph(subgraph: nx.MultiDiGraph, height: str = "600px"):
         },
     }))
 
-    # Add nodes
+    # add all the entity nodes
     for nid, data in subgraph.nodes(data=True):
         name = data.get("name", nid)
         etype = data.get("entity_type", "Concept")
@@ -132,7 +126,7 @@ def render_pyvis_graph(subgraph: nx.MultiDiGraph, height: str = "600px"):
             size=15 + min(subgraph.degree(nid) * 3, 30),
         )
 
-    # Add edges
+    # add the claim edges
     for u, v, key, data in subgraph.edges(data=True, keys=True):
         relation = data.get("relation", "related_to")
         confidence = data.get("confidence", 0.5)
@@ -160,13 +154,13 @@ def render_pyvis_graph(subgraph: nx.MultiDiGraph, height: str = "600px"):
             dashes=not is_current,
         )
 
-    # Save to temp file and read
+    # write to a temp file so Streamlit can embed it
     with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False) as f:
         net.save_graph(f.name)
         return f.name
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# -- Sidebar navigation --
 
 def sidebar():
     st.sidebar.title("🔍 Memory Graph Explorer")
@@ -180,7 +174,7 @@ def sidebar():
     return page
 
 
-# ── Pages ──────────────────────────────────────────────────────────────────────
+# -- Page implementations --
 
 def page_graph_view():
     st.header("Graph View")
@@ -211,7 +205,7 @@ def page_graph_view():
         min_confidence = st.slider("Min Confidence", 0.0, 1.0, 0.5, 0.05)
         current_only = st.checkbox("Current claims only", value=False)
 
-    # Build filtered subgraph
+    # build a subgraph with just the stuff the user wants to see
     filtered_nodes = {
         nid for nid, d in G.nodes(data=True)
         if d.get("entity_type", "unknown") in selected_types
@@ -228,7 +222,7 @@ def page_graph_view():
                     if not current_only or data.get("is_current", True):
                         filtered_graph.add_edge(u, v, key=key, **data)
 
-    # Remove isolated nodes
+    # drop nodes with no connections — they just clutter the view
     isolates = list(nx.isolates(filtered_graph))
     filtered_graph.remove_nodes_from(isolates)
 
@@ -236,9 +230,8 @@ def page_graph_view():
             f"{filtered_graph.number_of_edges()} claims "
             f"(filtered from {G.number_of_nodes()}/{G.number_of_edges()})")
 
-    # Limit nodes for performance
+    # cap at 200 nodes so the browser doesn't choke
     if filtered_graph.number_of_nodes() > 200:
-        # Take top 200 by degree
         top_nodes = sorted(
             filtered_graph.nodes(),
             key=lambda n: filtered_graph.degree(n),
@@ -260,16 +253,16 @@ def page_graph_view():
 def page_query_chat():
     st.header("Query the Memory Graph")
 
-    # Initialize chat history
+    # set up chat history if this is the first visit
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display chat history
+    # show previous messages
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Chat input
+    # handle new messages
     if query := st.chat_input("Ask a question about the Enron emails..."):
         st.session_state.messages.append({"role": "user", "content": query})
         with st.chat_message("user"):
@@ -285,7 +278,7 @@ def page_query_chat():
                 response = "No relevant information found in the memory graph."
                 st.markdown(response)
             else:
-                # Show matched entities
+                # show what entities we matched on
                 st.markdown("**Matched Entities:**")
                 for ent in pack.matched_entities:
                     st.markdown(f"- **{ent['name']}** [{ent['entity_type']}] "
@@ -306,7 +299,7 @@ def page_query_chat():
                             st.caption(f"Author: {ev.get('author', 'unknown')} | "
                                        f"Time: {ev.get('timestamp', 'unknown')}")
 
-                # Try generating an answer via Ollama
+                # ask the LLM to synthesize an answer from the evidence
                 try:
                     with st.spinner("Generating grounded answer..."):
                         answer, _ = retriever.answer_question(query)
@@ -330,7 +323,7 @@ def page_evidence_inspector():
     mg = load_graph()
     G = mg.graph
 
-    # Let user search for an entity
+    # let the user search for any entity
     search = st.text_input("Search entity by name:")
 
     if search:
@@ -382,7 +375,7 @@ def page_merge_inspector():
 
     store = load_store()
 
-    # Merged entities
+    # show entities that have aliases (meaning they got merged)
     st.subheader("Entities with Aliases (merged)")
     entities_with_aliases = [
         e for e in store.entities.values() if e.aliases
@@ -397,7 +390,7 @@ def page_merge_inspector():
                 st.markdown(f"**Aliases:** {', '.join(ent.aliases)}")
                 st.markdown(f"**First seen:** {ent.first_seen}")
 
-    # Merge audit log
+    # the full log of every merge that happened
     st.subheader("Merge Audit Log")
     if not store.merge_log:
         st.info("No merge records found.")
@@ -422,14 +415,14 @@ def page_quality_metrics():
     mg = load_graph()
     metrics = mg.get_metrics()
 
-    # Graph stats
+    # top-level numbers
     col1, col2, col3 = st.columns(3)
     gs = metrics["graph_stats"]
     col1.metric("Entities", gs["nodes"])
     col2.metric("Claims", gs["edges"])
     col3.metric("Components", gs["connected_components"])
 
-    # Evidence stats
+    # how well-grounded are our claims?
     st.subheader("Evidence Quality")
     es = metrics["evidence_stats"]
     col1, col2, col3 = st.columns(3)
@@ -437,7 +430,7 @@ def page_quality_metrics():
     col2.metric("Avg Evidence/Claim", f"{es['avg_evidence_per_claim']:.2f}")
     col3.metric("Claims with No Evidence", es["claims_with_no_evidence"])
 
-    # Confidence stats
+    # confidence score distribution
     st.subheader("Confidence Distribution")
     cs = metrics["confidence_stats"]
     col1, col2, col3 = st.columns(3)
@@ -445,32 +438,32 @@ def page_quality_metrics():
     col2.metric("Min", f"{cs['min']:.2f}")
     col3.metric("Max", f"{cs['max']:.2f}")
 
-    # Temporal stats
+    # current vs historical claims
     st.subheader("Temporal Coverage")
     ts = metrics["temporal_stats"]
     col1, col2 = st.columns(2)
     col1.metric("Current Claims", ts["current_claims"])
     col2.metric("Historical Claims", ts["historical_claims"])
 
-    # Entity type distribution
+    # what kinds of entities do we have?
     st.subheader("Entity Type Distribution")
     st.bar_chart(metrics["entity_type_distribution"])
 
-    # Relation type distribution
+    # what kinds of relationships?
     st.subheader("Relation Type Distribution")
     st.bar_chart(metrics["relation_type_distribution"])
 
-    # Ingestion metrics
+    # raw ingestion stats
     st.subheader("Ingestion Metrics")
     st.json(metrics["ingestion_metrics"])
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# -- App entry point --
 
 def main():
     page = sidebar()
 
-    # Check data exists
+    # make sure the data files are there before we try to show anything
     if not os.path.exists(GRAPH_PATH) or not os.path.exists(STORE_PATH):
         st.error(
             "Data files not found. Please run the pipeline first:\n"

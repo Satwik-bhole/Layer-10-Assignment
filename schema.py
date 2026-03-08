@@ -1,15 +1,7 @@
 """
-Pydantic schema / ontology for the memory graph.
-
-Defines the typed, grounded objects that the extraction pipeline produces.
-Every claim is traceable to evidence with source_id, exact quote, offsets, and timestamp.
-
-Entity types:  User, Component, Bug, Feature, Issue, Label, Decision, Concept,
-               Organization, Topic, Project
-Relation types: created, reported, fixed, broke, depends_on, mentions, decided,
-                assigned_to, labeled, status_changed, duplicate_of, related_to,
-                caused_by, blocked_by, implements, reverted, sent_to, forwarded_to,
-                discussed, approved, escalated_to
+The data model for the whole system. Defines all the types we use — entities,
+claims, evidence, merge records — using Pydantic for validation and serialization.
+Claims always link back to the exact quote they came from, with timestamp and author.
 """
 
 from __future__ import annotations
@@ -22,7 +14,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-# ── Enums ──────────────────────────────────────────────────────────────────────
+# -- The types of things we can extract --────
 
 class EntityType(str, Enum):
     USER = "User"
@@ -62,10 +54,10 @@ class RelationType(str, Enum):
     ESCALATED_TO = "escalated_to"
 
 
-# ── Evidence (grounding) ───────────────────────────────────────────────────────
+# -- Evidence: the proof behind every claim --──
 
 class Evidence(BaseModel):
-    """A grounded pointer to the exact source text supporting a claim."""
+    """Points back to the exact piece of text that supports a claim."""
     source_id: str = Field(
         ..., description="Unique ID: email message-ID or thread + message index"
     )
@@ -91,10 +83,10 @@ class Evidence(BaseModel):
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
-# ── Entity ─────────────────────────────────────────────────────────────────────
+# -- Entity: a person, org, topic, etc. --────
 
 class Entity(BaseModel):
-    """A named thing extracted from the corpus."""
+    """Something we extracted from the emails — a person, company, topic, project, etc."""
     id: str = Field(..., description="Unique entity identifier (auto-generated)")
     name: str = Field(..., description="Canonical name of the entity")
     entity_type: EntityType = Field(..., description="Type of the entity")
@@ -112,18 +104,16 @@ class Entity(BaseModel):
         return v.strip()
 
     def canonical_key(self) -> str:
-        """Deterministic key for dedup: lowercased name + type."""
+        """A consistent key for matching — lowercased name + type."""
         return f"{self.entity_type.value}::{self.name.lower().strip()}"
 
 
-# ── Claim ──────────────────────────────────────────────────────────────────────
+# -- Claim: a fact linking two entities --────
 
 class Claim(BaseModel):
-    """
-    A factual assertion extracted from the corpus, linking two entities
-    with a typed relation. Every claim carries grounding evidence.
-
-    Supports temporal validity (valid_from / valid_until) for conflict resolution.
+    """A fact connecting two entities via some relationship.
+    Always backed by evidence, and tracks when the fact was true so we
+    can handle things changing over time.
     """
     id: str = Field(..., description="Unique claim identifier")
     subject_id: str = Field(..., description="Entity ID of the subject")
@@ -154,22 +144,22 @@ class Claim(BaseModel):
 
     @property
     def claim_key(self) -> str:
-        """Key for dedup: canonical (subject, relation, object) triple."""
+        """Unique key based on the subject-relation-object triple, used for dedup."""
         return f"{self.subject_id}::{self.relation.value}::{self.object_id}"
 
 
-# ── Extraction output (what LLM returns per comment/issue) ─────────────────────
+# -- What the LLM gives us back for each email --────
 
 class ExtractionResult(BaseModel):
-    """Output of the LLM extraction for a single source document."""
+    """The entities and claims extracted from a single email message."""
     entities: list[Entity] = Field(default_factory=list)
     claims: list[Claim] = Field(default_factory=list)
 
 
-# ── Merge audit log (for reversibility) ───────────────────────────────────────
+# -- Merge audit trail (so we can undo merges) --────
 
 class MergeRecord(BaseModel):
-    """Audit trail for entity or claim merges. Enables undo."""
+    """Keeps track of what got merged and saves the originals so we can undo it."""
     merge_id: str
     merge_type: str = Field(..., description="'entity' or 'claim'")
     source_ids: list[str] = Field(..., description="IDs that were merged")
@@ -182,10 +172,10 @@ class MergeRecord(BaseModel):
     )
 
 
-# ── Full memory store (serializable) ──────────────────────────────────────────
+# -- The big container that holds everything --────
 
 class MemoryStore(BaseModel):
-    """Top-level container for the entire memory graph state."""
+    """Top-level container for all entities, claims, and merge history. Can be saved/loaded from JSON."""
     entities: dict[str, Entity] = Field(default_factory=dict)
     claims: dict[str, Claim] = Field(default_factory=dict)
     merge_log: list[MergeRecord] = Field(default_factory=list)
